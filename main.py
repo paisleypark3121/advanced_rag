@@ -13,11 +13,23 @@ from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 import numpy as np
 
+from langchain.chat_models import ChatOpenAI
 from langchain.storage import InMemoryStore
+
 from langchain.retrievers import ParentDocumentRetriever
 
-from langchain.chat_models import ChatOpenAI
 from langchain.retrievers.multi_query import MultiQueryRetriever
+
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+
+from langchain.retrievers.document_compressors import EmbeddingsFilter
+
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
+
+from langchain.chains.query_constructor.base import AttributeInfo
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+
 
 
 '''
@@ -77,6 +89,7 @@ def get_data_vectors(docs, embedding):
 def get_documents_embeddings(docs, embedding):
     return [embedding.embed_query(doc.page_content) for doc in docs]
 
+# calculation and plot of the cosine simularity
 def get_similarity(embedding, data_vectors):
     vector1 = embedding.embed_query("How is the whether??")
     vector2 = embedding.embed_query("What is the Name of the Dogschool?")
@@ -113,6 +126,7 @@ def get_similarity(embedding, data_vectors):
 
     plt.show()
 
+# calculation and plot of the cosine simularity having smaller chunks
 def get_similarity_smaller_chunks(docs,embedding):
     text_splitter=RecursiveCharacterTextSplitter(chunk_size=120, chunk_overlap=10)
     docs=text_splitter.split_documents(docs)
@@ -194,6 +208,208 @@ def get_multi_query_retriever(docs,embedding):
     # - duplicated documents are removed
     # - we finally get the unuque documents as response
 
+# custom query variations generator
+def custom_query_variations_generator():
+    from typing import List
+
+    from langchain.chains import LLMChain
+    from langchain.output_parsers import PydanticOutputParser
+    from langchain.prompts import PromptTemplate
+    from pydantic import BaseModel, Field
+
+    class LineList(BaseModel):
+        lines: List[str] = Field(description="Lines of text")
+
+    class LineListOutputParser(PydanticOutputParser):
+        def __init__(self) -> None:
+            super().__init__(pydantic_object=LineList)
+
+        def parse(self, text: str) -> LineList:
+            lines = text.strip().split("\n")
+            return LineList(lines=lines)
+
+    output_parser = LineListOutputParser()
+
+    QUERY_PROMPT = PromptTemplate(
+        input_variables=["question"],
+        template="""You are an AI language model assistant. Your task is to generate five
+        different versions of the given user question to retrieve relevant documents from a vector
+        database. By generating multiple perspectives on the user question, your goal is to help
+        the user overcome some of the limitations of the distance-based similarity search.
+        Provide these alternative questions separated by newlines.
+        Original question: {question}""",
+    )
+
+    llm = ChatOpenAI(
+        temperature=0,
+        max_tokens=800,
+        model_kwargs={"top_p": 0, "frequency_penalty": 0, "presence_penalty": 0},
+    )
+
+    llm_chain = LLMChain(llm=llm, prompt=QUERY_PROMPT, output_parser=output_parser)
+    question = "What is the name of the dog school?"
+    result=llm_chain.invoke(question)
+    print(result)
+    #{'question': 'What is the name of the dog school?', 'text': LineList(lines=['1. Can you tell me the name of the dog training center?', '2. What is the official name of the dog school?', '3. Do you know the specific name of the dog school?', '4. Could you provide me with the name of the canine education institution?', "5. I'm curious about the dog school's name. Can you share it with me?"])}
+    
+# procedure to compress data before sending them
+# anyway it requires an additional cost of using LLM for such compression
+# this can be mitigated using filters but results could be not so relevant
+def get_contextual_compression(docs,embedding):
+
+    question = "What is the name of the dog school?"
+
+    vectorstore = Chroma(
+        collection_name="full_documents", 
+        embedding_function=embedding
+    )
+    vectorstore.add_documents(docs)
+    retriever = vectorstore.as_retriever()
+    result=retriever.get_relevant_documents(query=question)
+    #print(result)
+
+    llm = ChatOpenAI(
+        temperature=0,
+        max_tokens=800,
+        model_kwargs={"top_p": 0, "frequency_penalty": 0, "presence_penalty": 0},
+    )
+
+    # OPTION 1 - More expensive
+    # compressor = LLMChainExtractor.from_llm(llm)
+    # compression_retriever = ContextualCompressionRetriever(
+    #     base_compressor=compressor, base_retriever=retriever)
+
+    # compressed_docs = compression_retriever.get_relevant_documents(
+    #     query=question)
+    # pretty_print_docs(compressed_docs)
+    '''
+    Document 1:
+    The school is called "Canine Academy".
+    ----------------------------------------------------------------------------------------------------
+    Document 2:
+    Fiktive Hundeschule: Canine Academy
+    ----------------------------------------------------------------------------------------------------
+    Document 3:
+    Canine Academy
+    ----------------------------------------------------------------------------------------------------
+    Document 4:
+    Canine Academy
+    '''
+
+    # OPTION 2 - A filter drops all documents that have a similarity lower than the threshold
+    embeddings_filter = EmbeddingsFilter(embeddings=embedding, similarity_threshold=0.9)
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=embeddings_filter, base_retriever=retriever)
+
+    compressed_docs = compression_retriever.get_relevant_documents(query=question)
+    pretty_print_docs(compressed_docs)
+    '''
+    Document 1:
+    A1: The school is called "Canine Academy".
+    ----------------------------------------------------------------------------------------------------
+    Document 2:
+    Fiktive Hundeschule: Canine Academy
+    Q1: What is the name of the dog training school?
+    '''
+
+    # please note that we could also use a chain of filters
+    # splitter = CharacterTextSplitter(chunk_size=300, chunk_overlap=0, separator=". ")
+    # redundant_filter = EmbeddingsRedundantFilter(embeddings=embedding)
+    # relevant_filter = EmbeddingsFilter(embeddings=embedding, similarity_threshold=0.76)
+    # pipeline_compressor = DocumentCompressorPipeline(
+    #     transformers=[splitter, redundant_filter, relevant_filter]
+    # )
+
+    # compression_retriever = ContextualCompressionRetriever(base_compressor=pipeline_compressor, base_retriever=retriever)
+
+    # compressed_docs = compression_retriever.get_relevant_documents(query=question)
+    # pretty_print_docs(compressed_docs)
+
+# makes use of different algorithms to get the relevant documents
+def get_ensemble_retriever(docs,embedding):
+
+    question = "What is the name of the dog school?"
+
+    bm25_retriever = BM25Retriever.from_documents(docs)
+    bm25_retriever.k = 2
+
+    chroma_vectorstore = Chroma.from_documents(docs, embedding)
+    chroma_retriever = chroma_vectorstore.as_retriever()
+
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, chroma_retriever], weights=[0.5, 0.5]
+    )
+    docs = ensemble_retriever.get_relevant_documents(query=question)
+    print(docs)
+    #[Document(page_content='Fiktive Hundeschule: Canine Academy\nQ1: What is the name of the dog training school?', metadata={'source': './dogs.txt'}), Document(page_content='A1: The school is called "Canine Academy".', metadata={'source': './dogs.txt'}), Document(page_content="Fiktives Restaurant: Gourmet's Delight\nQ1: What is the name of the restaurant?", metadata={'source': './restaurant.txt'}), Document(page_content='Q3: What training programs are offered at Canine Academy?', metadata={'source': './dogs.txt'}), Document(page_content='Q7: Does Canine Academy provide training for service or therapy dogs?', metadata={'source': './dogs.txt'})]
+
+# it uses metadata to extract documents
+def get_self_querying_retriever(embedding):
+    docs = [
+        Document(
+            page_content="Bello-Basistraining offers a comprehensive foundation for dog obedience, focusing on basic commands and socialization.",
+            metadata={"type": "Basic Training", "feature": "Foundational Skills", "price": "Affordable"},
+        ),
+        Document(
+            page_content="Pfote-Agilitykurs provides a fun and energetic way to keep dogs fit and mentally stimulated through obstacle courses.",
+            metadata={"type": "Agility Training", "feature": "Physical Fitness", "price": "Moderate"},
+        ),
+        Document(
+            page_content="Wuff-Verhaltensberatung specializes in addressing behavioral issues, offering tailored strategies for each dog.",
+            metadata={"type": "Behavioral Consultation", "feature": "Customized Solutions", "price": "Premium"},
+        ),
+        Document(
+            page_content="Schwanzwedeln-Therapiehundausbildung prepares dogs for roles in therapeutic and support settings, focusing on empathy and gentleness.",
+            metadata={"type": "Therapy Dog Training", "feature": "Emotional Support", "price": "High"},
+        ),
+        Document(
+            page_content="Schnüffler-Suchhundetraining trains dogs in scent detection, useful for search and rescue operations.",
+            metadata={"type": "Search and Rescue Training", "feature": "Advanced Skills", "price": "Variable"},
+        ),
+        Document(
+            page_content="Hunde-Haftpflichtversicherung offers comprehensive coverage for potential damages or injuries caused by your dog.",
+            metadata={"type": "Dog Liability Insurance", "feature": "Financial Protection", "price": "Varies"},
+        ),
+    ]
+
+    vectorstore = Chroma.from_documents(docs, embedding)
+
+    metadata_field_info = [
+        AttributeInfo(
+            name="type",
+            description="The type of dog training service (e.g., Basic Training, Agility Training, Behavioral Consultation)",
+            type="string",
+        ),
+        AttributeInfo(
+            name="feature",
+            description="Special features or benefits of the service",
+            type="string",
+        ),
+        AttributeInfo(
+            name="price",
+            description="Price category of the service (e.g., Affordable, Moderate, Premium)",
+            type="string",
+        ),
+    ]
+
+    llm = ChatOpenAI(
+        temperature=0,
+        max_tokens=800,
+        model_kwargs={"top_p": 0, "frequency_penalty": 0, "presence_penalty": 0},
+    )
+
+    document_content_description = "Description of a dog training service"
+    retriever = SelfQueryRetriever.from_llm(
+        llm,
+        vectorstore,
+        document_content_description,
+        metadata_field_info,
+    )
+    result=retriever.invoke("What Premium priced trainings do you offer?")
+    print(result)
+    #[Document(page_content='Wuff-Verhaltensberatung specializes in addressing behavioral issues, offering tailored strategies for each dog.', metadata={'feature': 'Customized Solutions', 'price': 'Premium', 'type': 'Behavioral Consultation'})]     
+
+
 
 embedding = OpenAIEmbeddings()#chunk_size=1)
 
@@ -224,8 +440,16 @@ chunks=get_chunks(docs)
 #get_parent_relevant_documents(docs, embedding)
 
 # get relevant documents using multi query retriever
-get_multi_query_retriever(chunks, embedding)
+#get_multi_query_retriever(chunks, embedding)
 
 # docs=merge_loaders()
 # data_vectors=get_data_vectors(docs,embedding)
 # print(len(data_vectors))
+
+#custom_query_variations_generator()
+
+#get_contextual_compression(chunks,embedding)
+
+#get_ensemble_retriever(chunks,embedding)
+
+get_self_querying_retriever(embedding)
